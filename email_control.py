@@ -1,4 +1,9 @@
-"""Optional mail-to-email control channel, without a web server."""
+"""Optional mail-to-email control channel: no web server, no incoming TCP port.
+
+The user clicks a ``mailto:`` link in a GPU alert and confirms by sending the
+prefilled message. An IMAP poll validates the sender and an expiring HMAC token.
+Incoming mail is never considered GPU market information.
+"""
 from __future__ import annotations
 
 import base64
@@ -86,6 +91,7 @@ def verify_token(action, token, secret, now=None):
 def mailto_link(action, cfg, now=None):
     token = make_token(action, cfg['secret'], now)
     subject = f'GPUCTRL {action.upper()} {token}'
+    # Mail clients open a message, but cannot send it without user confirmation.
     return 'mailto:' + quote(cfg['user'], safe='@') + '?' + urlencode({
         'subject': subject,
         'body': 'GPUShare 监控控制指令：请保持邮件主题不变，点击发送即可。\n'
@@ -94,7 +100,10 @@ def mailto_link(action, cfg, now=None):
 
 
 def control_section(action, cfg):
-    label = '暂停监测' if action == 'pause' else '恢复监测'
+    if action == 'pause':
+        label = '暂停监测'
+    else:
+        label = '恢复监测'
     return ('\n\n【邮件控制】\n'
             f'点击以下链接 → 邮件应用打开预填邮件 → 由你点击“发送”，即可{label}：\n'
             f'{mailto_link(action, cfg)}\n'
@@ -103,6 +112,7 @@ def control_section(action, cfg):
 
 
 def parse_signed_command(raw, cfg, now=None):
+    """Return action/token pair if sender and signature are valid; else None."""
     if len(raw) > 64 * 1024:
         return None
     try:
@@ -125,6 +135,7 @@ def parse_control_message(raw, cfg, now=None):
 
 
 def _mailbox_uids(client, after_uid):
+    # Search in UID namespace so sequence numbers do not drift when mail is deleted.
     status, data = client.uid('SEARCH', None, f'UID {after_uid + 1}:*')
     if status != 'OK' or not data:
         raise MailControlError('IMAP UID SEARCH 失败')
@@ -151,6 +162,7 @@ def _uidvalidity(client):
 
 
 def _fetch_header(client, uid):
+    # UID FETCH with PEEK does not set Seen; retrieve just headers.
     status, data = client.uid('FETCH', str(uid), '(BODY.PEEK[HEADER])')
     if status != 'OK' or not data:
         raise MailControlError('IMAP UID FETCH 失败')
@@ -161,6 +173,11 @@ def _fetch_header(client, uid):
 
 
 def scan_mail_controls(state, cfg, client_factory=None, now=None):
+    """Return (updated_state, accepted_actions) without changing remote messages.
+
+    On first use/reset: establish watermark from existing mail, not old commands.
+    The caller persists state before sending any acknowledgement.
+    """
     client_factory = client_factory or imaplib.IMAP4_SSL
     client = client_factory(cfg['host'], cfg['port'], timeout=15)
     try:
@@ -170,6 +187,7 @@ def scan_mail_controls(state, cfg, client_factory=None, now=None):
             raise MailControlError('IMAP INBOX 不可访问')
         validity = _uidvalidity(client)
         result = dict(state)
+        # A mailbox reset invalidates old UIDs. Skip preexisting commands.
         if result.get('imap_uidvalidity') != validity or type(result.get('imap_last_uid')) is not int:
             result['imap_uidvalidity'] = validity
             result['imap_last_uid'] = _max_uid(client)
