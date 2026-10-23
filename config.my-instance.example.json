@@ -1,0 +1,24 @@
+{
+  "target": {
+    "instance_id": "I2ba996131d00a01558",
+    "machine_id": "MACHL7cYdJ32V4WRGwRGsbSN",
+    "gpu_model": "4080s-32G",
+    "gpu_count": 1,
+    "region": "西北",
+    "quoted_hourly_cny": 1.8,
+    "console_url": "https://gpushare.com/"
+  },
+  "poll_seconds": 60,
+  "source": {
+    "confirmed_read_only": false,
+    "url": "",
+    "method": "GET",
+    "headers": {},
+    "json_body": {},
+    "success_path": "",
+    "records_path": "data.machines",
+    "id_path": "id",
+    "model_path": "gpu_model",
+    "free_path": "free_gpu_count"
+  }
+}
