@@ -1,0 +1,21 @@
+{
+  "target": {
+    "machine_id": "REPLACE_WITH_EXACT_MACHINE_ID",
+    "gpu_model": "REPLACE_WITH_EXACT_GPU_MODEL",
+    "gpu_count": 1,
+    "console_url": "https://gpushare.com/"
+  },
+  "poll_seconds": 60,
+  "source": {
+    "confirmed_read_only": false,
+    "url": "",
+    "method": "GET",
+    "headers": {},
+    "json_body": {},
+    "success_path": "",
+    "records_path": "data.machines",
+    "id_path": "id",
+    "model_path": "gpu_model",
+    "free_path": "free_gpu_count"
+  }
+}
