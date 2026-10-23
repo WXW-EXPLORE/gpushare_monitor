@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from gpushare_monitor import ProbeError, cycle, evaluate, load_state, save_state, validate, env_headers
+from gpushare_monitor import ProbeError, cycle, evaluate, load_state, save_state, validate, env_headers, inspect_json, NoRedirect
 
 
 BASE = {
@@ -93,6 +93,29 @@ class MonitorTests(unittest.TestCase):
             save_state(p, {'a': True})
             self.assertEqual(load_state(p), {'a': True})
             self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+
+    def test_screenshot_instance_target(self):
+        cfg_path = Path(__file__).resolve().parent.parent/'config.my-instance.example.json'
+        cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+        self.assertEqual(cfg['target']['gpu_model'], '4080s-32G')
+        self.assertEqual(cfg['target']['gpu_count'], 1)
+        self.assertEqual(cfg['target']['machine_id'], 'MACHL7cYdJ32V4WRGwRGsbSN')
+        self.assertFalse(cfg['source']['confirmed_read_only'])
+        with self.assertRaises(ValueError):
+            validate(cfg)
+
+    def test_offline_inspect_json_no_secrets(self):
+        data = {'data': {'machines': [
+            {'machineId': 'MACHL7cYdJ32V4WRGwRGsbSN', 'idleGpuCount': 1,
+             'token': 'secret-never-print'}, {'machineId': 'another', 'idleGpuCount': 5}]}}
+        msg = inspect_json(data, 'MACHL7cYdJ32V4WRGwRGsbSN')
+        self.assertIn('idleGpuCount', msg)
+        self.assertIn('machineId', msg)
+        self.assertNotIn('secret-never-print', msg)
+        self.assertIn('没有找到', inspect_json(data, 'not-found'))
+
+    def test_no_cross_site_redirects(self):
+        self.assertIsNone(NoRedirect().redirect_request(None, None, 302, 'Found', {}, 'https://evil.example'))
 
     def test_header_refs_only(self):
         with self.assertRaises(ProbeError):
