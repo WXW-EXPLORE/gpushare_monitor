@@ -10,12 +10,28 @@
 - 同型号 GPU 在**其他主机**有库存，不代表你的已有实例能启动。程序必须精确匹配 `machine_id` 并比对所需卡数；机器缺失、数据缺字段、登录过期、错误与接口异常统一判定为 **UNKNOWN**，绝不判为可用。
 - 本程序不提供任何写入 GPUShare 的 API。只有你明确核实数据源是只读操作后才能启用；程序强制域名白名单和 HTTPS，并阻止常见的开机/购买/删除等操作路径。
 
+## 目标机器（根据用户截图）
+
+已在 `config.my-instance.example.json` 预填目标资源（不含账号、Cookie、邮箱凭据）：
+
+| 字段 | 值 |
+| --- | --- |
+| 地区 | 西北 |
+| 目标 GPU | 4080s-32G × 1 |
+| 机器 ID | `MACHL7cYdJ32V4WRGwRGsbSN` |
+| 实例 ID | `I2ba996131d00a01558` |
+| 截图价格 | ¥1.80/小时（仅当时显示价） |
+
+**请在控制台核对机器 ID 的大小写。** 机器 ID 与实例 ID 不同：库存检查需要匹配物理主机 ID，不是 GPU 型号的市场总库存。截图的“无空闲显卡”仅说明截图时状态，不能作持续监控数据源。
+
+**重要：** 截图中 /hy-tmp 数据保留倒计时已不足 55 小时；实例到期日不代表临时盘保留期限。请及时备份重要科研数据。
+
 ## 1. 部署预备
 
 ```bash
 git clone https://github.com/WXW-EXPLORE/gpushare_monitor.git
 cd gpushare_monitor
-cp config.example.json config.json
+cp config.my-instance.example.json config.json
 cp .env.example .env
 chmod 600 config.json .env
 python3 -m unittest discover -s tests -v
@@ -33,7 +49,15 @@ python3 gpushare_monitor.py test-mail
 
 在浏览器手动登录 GPUShare（**仅用于你手工核对数据源**）。打开开发者工具 → Network → Fetch/XHR，找到“我的实例”或“云市场”显示**与原实例相同物理主机 ID、显卡型号、空闲卡数**的只读请求。确认请求只查询数据、不引发状态变化，且使用符合平台规则的访问方式。**不要复制开始/停止/购买等操作请求**。
 
-核对该请求的：请求 URL、GET 或只读 POST、必要的查询 JSON、返回 JSON 的字段结构，以及是否需要登录态。将这些映射进 `config.json`，例如**下面仅为假想结构，不是 GPUShare 已验证接口**：
+核对该请求的：请求 URL、GET 或只读 POST、必要的查询 JSON、返回 JSON 的字段结构，以及是否需要登录态。
+
+可以将**手动去除手机号、姓名、Cookie、Token 等敏感字段后的 JSON 响应**保存为本机 `sample.json`，运行以下命令离线检查是否包含目标机器 ID：
+
+```bash
+python3 gpushare_monitor.py inspect-json --config config.json --sample-file sample.json
+```
+
+此命令**不联网、不发邮件**，只打印匹配结构路径和疑似库存字段名称，不输出字段值。发现匹配仍不能证明该机器可启动，必须人工核对字段语义。排查结束后请删除样本文件，切勿提交仓库。将这些映射进 `config.json`，例如**下面仅为假想结构，不是 GPUShare 已验证接口**：
 
 ```json
 {
@@ -101,3 +125,9 @@ python3 -m py_compile gpushare_monitor.py
 测试覆盖精确机器匹配、数量要求、数据缺失/异常、去重与重新触发、邮件失败后重试、敏感信息环境变量、状态持久化。测试只用合成响应，不对真实平台发请求。
 
 **安全提醒：** 按官方文档，停止的实例满 10 天可能被自动释放；`/hy-tmp` 在停机 24 小时后也可能清除数据，请提前备份重要研究文件。
+
+## 补充安全与现状说明
+
+- 当前只建立监控核心和目标匹配配置，**未确认免登录的真实实时库存接口，不应部署后台循环并期待收到真实有卡邮件**。
+- HTTP 禁止重定向，以免会话请求头被送到其他站点。程序不自动登录，也不绕过验证码或限制。
+- 一个仅提供 GPU 型号、价格的第三方数据源不足以证明上述**指定机器 ID**出现空闲资源。无法确定时只报 UNKNOWN。
