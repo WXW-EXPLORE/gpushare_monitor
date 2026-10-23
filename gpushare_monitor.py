@@ -6,6 +6,7 @@ import argparse
 import contextlib
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from html import escape as html_escape
 import fcntl
 import json
 import logging
@@ -19,8 +20,9 @@ import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+from email_control import MailControlError, read_control_config, scan_mail_controls, control_section
 
 LOG = logging.getLogger('gpushare_monitor')
 MAX_RESPONSE = 1024 * 1024
@@ -28,14 +30,19 @@ UNSAFE_PATH_PARTS = {'start', 'stop', 'restart', 'reboot', 'boot', 'create', 'bu
 
 
 class NoRedirect(HTTPRedirectHandler):
-    """Prevent forwarding session headers across redirects."""
+    """Prevent redirecting login/session headers to another origin."""
 
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         return None
 
 
+
 class ProbeError(Exception):
     """A probe failure is UNKNOWN, never interpreted as out-of-stock."""
+
+
+class NotListed(ProbeError):
+    """A complete market scan did not list the target. NOT proof of zero idle GPUs."""
 
 
 def path_value(root, path):
@@ -54,10 +61,17 @@ def path_value(root, path):
 
 def validate(cfg):
     target, source = cfg['target'], cfg['source']
-    if not str(target.get('machine_id', '')).strip():
-        raise ValueError('请填写 target.machine_id（具体机器 ID，不是 GPU 型号）')
+    mode = target.get('match_mode', 'machine')
+    if mode not in ('machine', 'gpu_model'):
+        raise ValueError('target.match_mode 只能是 machine 或 gpu_model')
+    if not str(target.get('gpu_model', '')).strip():
+        raise ValueError('target.gpu_model 不允许为空')
+    if mode == 'machine' and not str(target.get('machine_id', '')).strip():
+        raise ValueError('机器精确匹配模式须填写 target.machine_id')
     if type(target.get('gpu_count')) is not int or target['gpu_count'] < 1:
         raise ValueError('target.gpu_count 必须是正整数')
+    if mode == 'gpu_model' and source.get('kind') != 'gpushare_market':
+        raise ValueError('按 GPU 型号匹配只支持已核验结构的 gpushare_market 数据源')
     if not source.get('confirmed_read_only'):
         raise ValueError('仅在确认 endpoint 是只读查询后，将 source.confirmed_read_only 设为 true')
     url = source.get('url', '')
@@ -69,11 +83,31 @@ def validate(cfg):
     segments = {p.lower().replace('_', '-') for p in parts.path.split('/') if p}
     if any(p in UNSAFE_PATH_PARTS for p in segments):
         raise ValueError('拒绝访问疑似修改实例状态的接口')
-    if source.get('method', 'GET') not in ('GET', 'POST'):
-        raise ValueError('仅支持只读 GET 或已确认安全的 POST 查询')
-    for field in ('records_path', 'id_path', 'free_path'):
-        if not source.get(field):
-            raise ValueError(f'请配置 source.{field}')
+    if source.get('kind') == 'gpushare_market':
+        validate_market_diagnostic(source)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if query.get('gpuName') != target.get('gpu_model'):
+            raise ValueError('云市场 gpuName 必须与目标显卡型号一致')
+        if query.get('vmType') != 'docker':
+            raise ValueError('仅支持截图中验证的 vmType=docker')
+        try:
+            page_size = int(query.get('ps', '0'))
+            min_num = int(query.get('minGpuNum', '0'))
+        except ValueError as exc:
+            raise ValueError('云市场分页/显卡数参数无效') from exc
+        if not (1 <= page_size <= 100) or not (1 <= min_num <= target['gpu_count']):
+            raise ValueError('云市场分页大小或最小显卡数配置不合法')
+        max_pages = source.get('max_pages', 30)
+        if type(max_pages) is not int or not (1 <= max_pages <= 60):
+            raise ValueError('max_pages 必须在 1 到 60 之间')
+    else:
+        if source.get('kind') not in (None, 'generic'):
+            raise ValueError('未知的库存数据源类型')
+        if source.get('method', 'GET') not in ('GET', 'POST'):
+            raise ValueError('仅支持只读 GET 或已确认安全的 POST 查询')
+        for field in ('records_path', 'id_path', 'free_path'):
+            if not source.get(field):
+                raise ValueError(f'请配置 source.{field}')
     interval = cfg.get('poll_seconds', 60)
     if type(interval) is not int or interval < 60:
         raise ValueError('poll_seconds 至少 60 秒')
@@ -94,7 +128,7 @@ def env_headers(src):
     return headers
 
 
-def fetch_json(src):
+def fetch_one_json(src):
     headers = env_headers(src)
     method = src.get('method', 'GET')
     data = None
@@ -123,9 +157,152 @@ def fetch_json(src):
         raise ProbeError('接口返回非 JSON 数据（可能需要登录）') from exc
 
 
+def market_page_url(url, page):
+    """Preserve every observed filter; only change the positive page number."""
+    parts = urlsplit(url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    params['pn'] = str(page)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(params), ''))
+
+
+def validate_market_page(data):
+    """Check business success and pagination structure before any inventory evaluation."""
+    if not isinstance(data, dict) or type(data.get('status')) is not int or data['status'] != 0:
+        raise ProbeError('云市场返回非成功状态（可能未登录或登录态失效）')
+    body = data.get('data')
+    if not isinstance(body, dict):
+        raise ProbeError('云市场响应缺少 data 对象')
+    records, total = body.get('list'), body.get('total')
+    if not isinstance(records, list) or type(total) is not int or total < 0:
+        raise ProbeError('云市场分页数据缺失或无效')
+    if not all(isinstance(record, dict) for record in records):
+        raise ProbeError('云市场机器列表结构无效')
+    return records, total
+
+
+def fetch_market_pages(src, get_page=None):
+    """Scan *all* pages or return UNKNOWN; page one alone can miss this machine.
+
+    A market-list entry is evidence of marketplace supply, not a guaranteed
+    right for an existing stopped instance to boot on that host.
+    """
+    get_page = get_page or fetch_one_json
+    parts = urlsplit(src['url'])
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    page_size = int(params['ps'])
+    first = get_page({**src, 'url': market_page_url(src['url'], 1)})
+    items, total = validate_market_page(first)
+    pages = (total + page_size - 1) // page_size
+    if pages > src.get('max_pages', 30):
+        raise ProbeError(f'目标云市场共 {total} 条，超出分页上限；不能保证遍历完整')
+    combined = list(items)
+    if total == 0 and items:
+        raise ProbeError('云市场总数为 0 但仍有机器记录')
+    for page in range(2, pages + 1):
+        next_data = get_page({**src, 'url': market_page_url(src['url'], page)})
+        next_items, next_total = validate_market_page(next_data)
+        if next_total != total:
+            raise ProbeError('分页期间市场总数发生变化，本轮重新检查')
+        combined.extend(next_items)
+    if len(combined) != total:
+        raise ProbeError(f'分页结果不完整：预期 {total} 条，实得 {len(combined)} 条')
+    return {'status': 0, 'data': {'list': combined, 'total': total}}
+
+
+def fetch_json(src):
+    if src.get('kind') == 'gpushare_market':
+        return fetch_market_pages(src)
+    return fetch_one_json(src)
+
+
+def market_candidates(data, target):
+    """Find *any* qualifying hosts for this GPU model, not the old machine.
+
+    A qualifying host must individually have >= gpu_count free GPUs;
+    GPU counts from separate hosts cannot be combined to meet a multi-GPU need.
+    """
+    items, total = validate_market_page(data)
+    if len(items) != total:
+        raise ProbeError('市场分页结果不完整，不能确认库存')
+    mode = target.get('match_mode', 'machine')
+    if mode == 'machine':
+        relevant = [item for item in items if item.get('machineId') == target['machine_id']]
+        if not relevant:
+            raise NotListed('目标机器未出现在完整市场列表')
+        if len(relevant) != 1:
+            raise ProbeError('目标 machineId 出现多次，无法确认库存')
+    elif mode == 'gpu_model':
+        relevant = [item for item in items if item.get('gpuName') == target['gpu_model']]
+        if not relevant:
+            # A genuinely empty filtered listing indicates no model supply
+            # observed, NOT a verified inventory of an existing VM.
+            raise NotListed('完整市场列表没有此型号的机器记录')
+        ids = [item.get('machineId') for item in relevant]
+        if not all(isinstance(x, str) and x.strip() for x in ids):
+            raise ProbeError('市场机器 ID 缺失，无法消除重复记录')
+        if len(ids) != len(set(ids)):
+            raise ProbeError('市场中出现重复机器 ID，拒绝重复统计')
+    else:
+        raise ProbeError('不支持的匹配模式')
+
+    candidates = []
+    incomplete = False
+    for item in relevant:
+        if item.get('gpuName') != target['gpu_model']:
+            if mode == 'machine':
+                raise ProbeError('machineId 匹配但 GPU 型号不一致')
+            continue
+        if mode == 'machine' and target.get('region') and item.get('regionName') != target['region']:
+            raise ProbeError('原机器地区与预期不符')
+        num, used = item.get('gpuNum'), item.get('gpuUsed')
+        if (type(num) is not int or type(used) is not int or
+                num < 0 or not (0 <= used <= num)):
+            incomplete = True
+            continue
+        free = num - used
+        # Ignore definitely unavailable hosts. If an indicator's *type* is
+        # unknown, do not count it as in stock.
+        if type(item.get('status')) is not int or type(item.get('isOnline')) is not bool:
+            incomplete = True
+            continue
+        if item['status'] != 1 or not item['isOnline']:
+            continue
+        skus = item.get('skuList')
+        if not isinstance(skus, list):
+            incomplete = True
+            continue
+        payg = [sku for sku in skus if isinstance(sku, dict) and sku.get('skuName') == 'payg']
+        if len(payg) != 1:
+            incomplete = True
+            continue
+        if type(payg[0].get('status')) is not int or type(payg[0].get('enable')) is not int:
+            incomplete = True
+            continue
+        if payg[0]['status'] != 1 or payg[0]['enable'] != 1:
+            continue
+        if free >= target['gpu_count']:
+            candidates.append({'machine_id': item.get('machineId'),
+                               'region': item.get('regionName', '未提供'),
+                               'free': free})
+    # One verified available host suffices for a truthful positive alert;
+    # malformed *other* rows should not conceal its existence.
+    if not candidates and incomplete:
+        raise ProbeError('匹配型号的部分记录缺少必要字段，未能确认是否有货')
+    return candidates
+
+
+def evaluate_market(data, target):
+    """Return (any_available, sum_free_on_individually_eligible_hosts)."""
+    candidates = market_candidates(data, target)
+    return bool(candidates), sum(item['free'] for item in candidates)
+
+
 def evaluate(data, cfg):
     """Return (available: bool, free: int). Unknown results raise ProbeError."""
     src, target = cfg['source'], cfg['target']
+    if src.get('kind') == 'gpushare_market':
+        return evaluate_market(data, target)
     if src.get('success_path'):
         if path_value(data, src['success_path']) != src.get('success_value', True):
             raise ProbeError('接口明确返回失败或未登录')
@@ -153,7 +330,10 @@ def evaluate(data, cfg):
 
 
 def inspect_json(data, machine_id):
-    """Show only structural hints, never sample values or confidential fields."""
+    """Only show matching structure and safe field *names*, never sample contents.
+
+    The returned hints do NOT prove the endpoint is read-only or available.
+    """
     matches = []
     visited = 0
 
@@ -190,6 +370,50 @@ def inspect_json(data, machine_id):
     return '\n'.join(lines)
 
 
+def describe_json_shape(data, max_depth=4, max_lines=32):
+    """Describe JSON shape without ever showing scalar values or access tokens.
+
+    This can be shared safely *after* the operator checks the field names.
+    No raw response content is stored or printed.
+    """
+    lines = []
+
+    def describe(value, path, depth):
+        if len(lines) >= max_lines:
+            return
+        if isinstance(value, dict):
+            keys = sorted(str(k) for k in value.keys())
+            lines.append(f'{path}: object keys={keys[:24]}' + (' ...' if len(keys) > 24 else ''))
+            if depth < max_depth:
+                for key, child in value.items():
+                    if isinstance(key, str) and isinstance(child, (dict, list)):
+                        describe(child, f'{path}.{key}', depth + 1)
+        elif isinstance(value, list):
+            lines.append(f'{path}: array length={len(value)}')
+            if depth < max_depth and value:
+                describe(value[0], f'{path}[0]', depth + 1)
+        else:
+            typename = 'null' if value is None else type(value).__name__
+            lines.append(f'{path}: {typename} (value hidden)')
+
+    describe(data, '$', 0)
+    return '\n'.join(lines[:max_lines])
+
+
+def validate_market_diagnostic(source):
+    """Allow one screenshot-confirmed read-only GET for schema investigation.
+
+    The endpoint's *response semantics* are not verified yet, so this must never
+    enable actual alerts or write back to GPUShare.
+    """
+    parts = urlsplit(source.get('url', ''))
+    if (parts.scheme != 'https' or parts.hostname != 'api.gpushare.com'
+            or parts.port not in (None, 443) or parts.username or parts.password
+            or parts.fragment or parts.path != '/app/api/market/machine/list'
+            or source.get('method', 'GET') != 'GET'):
+        raise ValueError('诊断模式只允许截图中的 GET https://api.gpushare.com/app/api/market/machine/list')
+
+
 def smtp_config():
     keys = ('SMTP_HOST', 'SMTP_FROM', 'SMTP_TO')
     missing = [k for k in keys if not os.environ.get(k)]
@@ -205,6 +429,17 @@ def send_mail(subject, body):
     msg['From'] = m['SMTP_FROM']
     msg['To'] = m['SMTP_TO']
     msg.set_content(body)
+    # Render a human-readable mailto control link in modern mail clients;
+    # HTML is static except for escaped server-generated mailto URLs.
+    if 'mailto:' in body:
+        import re as _re
+        def _render_line(line):
+            if line.startswith('mailto:'):
+                safe_url = html_escape(line.strip(), quote=True)
+                return f'<a href="{safe_url}">点此发送监控控制邮件（需你确认发送）</a>'
+            return html_escape(line, quote=True)
+        rendered = '<br>\n'.join(_render_line(line) for line in body.splitlines())
+        msg.add_alternative('<html><body>' + rendered + '</body></html>', subtype='html')
     user, password = os.environ.get('SMTP_USER', ''), os.environ.get('SMTP_PASSWORD', '')
     if bool(user) != bool(password):
         raise RuntimeError('SMTP_USER 与 SMTP_PASSWORD 必须同时设置')
@@ -253,13 +488,31 @@ def save_state(path, obj):
 def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
     now = now or datetime.now(timezone.utc).isoformat(timespec='seconds')
     result = dict(state)
-    # Bind state to a particular resource; do not inherit alert suppression from other machines.
-    signature = f"{cfg['target']['machine_id']}:{cfg['target']['gpu_count']}:{cfg['source']['url']}"
+    # State changes with matching mode so old per-machine alerts never suppress
+    # notifications for ANY 4080s-32G supply.
+    t = cfg['target']
+    signature = (f"{t.get('match_mode', 'machine')}:{t.get('machine_id', '')}:"
+                 f"{t['gpu_model']}:{t['gpu_count']}:{cfg['source']['url']}")
     if result.get('signature') != signature:
-        result = {'signature': signature, 'alerted': False, 'unavailable_streak': 0, 'errors': 0}
+        # Do not discard IMAP watermark or pause state on first market cycle
+        # or when changing the monitored GPU model.
+        controls = {k: result[k] for k in
+                    ('paused', 'imap_uidvalidity', 'imap_last_uid', 'used_control_tokens')
+                    if k in result}
+        result = {'signature': signature, 'alerted': False, 'unavailable_streak': 0,
+                  'errors': 0, **controls}
     try:
         data = probe(cfg['source'])
         available, free = evaluate(data, cfg)
+    except NotListed:
+        result['errors'] = 0
+        result['unavailable_streak'] = result.get('unavailable_streak', 0) + 1
+        result['last_status'] = 'not_listed'
+        result['last_check'] = now
+        result.pop('free_gpus', None)
+        if result['unavailable_streak'] >= 2:
+            result['alerted'] = False
+        return result, 'NOT_LISTED: no matching resource in complete market listing'
     except (ProbeError, ValueError) as exc:
         result['errors'] = result.get('errors', 0) + 1
         result['unavailable_streak'] = 0
@@ -274,14 +527,32 @@ def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
         result['last_status'] = 'available'
         if not result.get('alerted'):
             target = cfg['target']
-            message = (f"GPUShare 发现候选空闲 GPU！\n\n"
-                       f"目标机器：{target['machine_id']}\n"
-                       f"GPU：{target.get('gpu_model', '未配置')}，需要 {target['gpu_count']} 张\n"
-                       f"查询返回空闲数量：{free}\n"
+            if cfg['source'].get('kind') == 'gpushare_market':
+                candidates = market_candidates(data, target)
+                hosts = len(candidates)
+                detail = '\n'.join(
+                    f"- {row['region']} · 空闲 {row['free']} 张（主机 {row['machine_id']}）"
+                    for row in candidates[:8])
+                if hosts > 8:
+                    detail += f'\n- 另有 {hosts - 8} 台候选机器'
+            else:
+                hosts = 1
+                detail = '固定机器模式：' + str(target.get('machine_id', '未配置'))
+            message = (f"GPUShare 云市场发现可租用的候选 GPU！\n\n"
+                       f"GPU 型号：{target['gpu_model']}，单台需要 {target['gpu_count']} 张\n"
+                       f"符合条件的机器数：{hosts}\n"
+                       f"这些机器上的候选空闲卡合计：{free} 张\n"
+                       f"候选机器详情：\n{detail}\n"
                        f"查询时间（UTC）：{now}\n\n"
                        f"请自行登录并尝试开机：{target.get('console_url', 'https://gpushare.com/')}\n\n"
-                       "仅依据配置的只读数据源判断，库存瞬时变化，不保证开机成功。")
-            notify('【GPUShare】目标机器出现空闲 GPU，请尽快手动开机', message)
+                       "注意：这是云市场快照，不保证旧实例能直接启动。"
+                       "如果原实例仍提示无卡，你可以在控制台手动评估迁移到可用机器；"
+                       "迁移前请确认 /hy-tmp 数据已备份，官方文档提示迁移会清除该目录。\n"
+                       "本服务不登录、不迁移、不启动、不购买任何 GPU。")
+            control = read_control_config()
+            if control is not None:
+                message += control_section('pause', control)
+            notify('【GPUShare】4080s 型号出现候选空闲 GPU，请手动检查', message)
             result['alerted'] = True
             result['last_alert'] = now
             return result, 'AVAILABLE: mail sent'
@@ -320,7 +591,7 @@ def process_lock(state_path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='GPUShare 只读候补监测及邮件通知')
-    parser.add_argument('command', choices=['check', 'once', 'monitor', 'test-mail', 'inspect-json'])
+    parser.add_argument('command', choices=['check', 'once', 'monitor', 'test-mail', 'test-control', 'inspect-json', 'inspect-live'])
     parser.add_argument('--config', default='config.json')
     parser.add_argument('--state', default='state/state.json')
     parser.add_argument('--sample-file', help='离线 JSON 样本，仅用于 inspect-json；不联网、不发邮件')
@@ -330,6 +601,15 @@ def main(argv=None):
         send_mail('【GPUShare】监控邮件测试', '测试成功。此邮件不代表发现空闲显卡。')
         LOG.info('邮件测试发送成功')
         return 0
+    if args.command == 'test-control':
+        control = read_control_config()
+        if control is None:
+            raise ValueError('邮件控制未启用，请先在 .env 填写 IMAP 和 CONTROL_* 参数')
+        text = '这是一封邮件控制功能测试，不代表发现空闲 GPU。'
+        send_mail('【GPUShare】邮件暂停控制测试（非库存提醒）',
+                  text + control_section('pause', control))
+        LOG.info('暂停测试邮件发送成功')
+        return 0
     cfg = json.loads(Path(args.config).read_text(encoding='utf-8'))
     if args.command == 'inspect-json':
         if not args.sample_file:
@@ -338,16 +618,72 @@ def main(argv=None):
         if sample_path.stat().st_size > MAX_RESPONSE:
             raise ValueError('样本文件超过 1 MiB，不予处理')
         data = json.loads(sample_path.read_text(encoding='utf-8'))
-        print(inspect_json(data, str(cfg['target']['machine_id'])))
+        print(describe_json_shape(data))
+        if cfg['target'].get('match_mode') == 'gpu_model':
+            print('--- GPU 型号模式（样例检查，不触发邮件）---')
+            try:
+                available, free = evaluate_market(data, cfg['target'])
+                print(f'available={available}, eligible_free_gpus={free}')
+            except ProbeError as exc:
+                print(f'无法确认市场库存：{exc}')
+        else:
+            print('--- 目标机器匹配 ---')
+            print(inspect_json(data, str(cfg['target']['machine_id'])))
+        return 0
+    if args.command == 'inspect-live':
+        # Explicit, single, read-only request only. No need to set confirmed_read_only.
+        validate_market_diagnostic(cfg['source'])
+        data = fetch_json(cfg['source'])
+        print('只读 GET 请求成功；仅输出响应结构，不保存或显示任何字段值。')
+        print(describe_json_shape(data))
+        if cfg['target'].get('match_mode') == 'gpu_model':
+            print('--- GPU 型号模式（样例检查，不触发邮件）---')
+            try:
+                available, free = evaluate_market(data, cfg['target'])
+                print(f'available={available}, eligible_free_gpus={free}')
+            except ProbeError as exc:
+                print(f'无法确认市场库存：{exc}')
+        else:
+            print('--- 目标机器匹配 ---')
+            print(inspect_json(data, str(cfg['target']['machine_id'])))
         return 0
     validate(cfg)
     if args.command == 'check':
-        avail, free = evaluate(fetch_json(cfg['source']), cfg)
-        print(f"{'AVAILABLE' if avail else 'UNAVAILABLE'} free={free} target={cfg['target']['machine_id']}")
+        try:
+            avail, free = evaluate(fetch_json(cfg['source']), cfg)
+        except NotListed:
+            print('NOT_LISTED: no matching model/host listed (not a guarantee your VM cannot start)')
+            return 0
+        print(f"{'AVAILABLE' if avail else 'UNAVAILABLE'} eligible_free={free} "
+              f"model={cfg['target']['gpu_model']} mode={cfg['target'].get('match_mode', 'machine')}")
         return 0
+    control = read_control_config() if args.command == 'monitor' else None
     with process_lock(args.state):
         while True:
             state = load_state(args.state)
+            if control is not None:
+                try:
+                    state, actions = scan_mail_controls(state, control)
+                    # Persist accepted commands before acknowledgement or market polling.
+                    save_state(args.state, state)
+                    for action in actions:
+                        message = (f'GPUShare 监测已{"暂停" if action == "pause" else "恢复"}。\n'
+                                   '这是监测程序自身状态变化，不会控制云端实例。')
+                        message += control_section('resume' if action == 'pause' else 'pause', control)
+                        try:
+                            send_mail(f'【GPUShare】监测已{"暂停" if action == "pause" else "恢复"}', message)
+                        except (OSError, smtplib.SMTPException, RuntimeError) as exc:
+                            LOG.error('邮件控制确认通知失败：%s', type(exc).__name__)
+                except Exception as exc:
+                    # Fail closed: no automatic mail control changes when IMAP fails.
+                    # Do not print credential-bearing exception messages.
+                    LOG.error('邮件控制检查失败（监测状态保持不变）：%s', type(exc).__name__)
+            if state.get('paused'):
+                LOG.info('PAUSED: email control; only checking for resume messages')
+                if args.command == 'once':
+                    return 0
+                time.sleep(cfg.get('poll_seconds', 60))
+                continue
             try:
                 state, msg = cycle(cfg, state)
                 try:
