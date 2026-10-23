@@ -20,11 +20,18 @@ import tempfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 LOG = logging.getLogger('gpushare_monitor')
 MAX_RESPONSE = 1024 * 1024
 UNSAFE_PATH_PARTS = {'start', 'stop', 'restart', 'reboot', 'boot', 'create', 'buy', 'order', 'pay', 'charge', 'release', 'delete', 'update', 'operate', 'power', 'rent'}
+
+
+class NoRedirect(HTTPRedirectHandler):
+    """Prevent forwarding session headers across redirects."""
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
 
 
 class ProbeError(Exception):
@@ -57,8 +64,8 @@ def validate(cfg):
     parts = urlsplit(url)
     if parts.scheme != 'https' or parts.hostname not in {'gpushare.com', 'www.gpushare.com', 'api.gpushare.com'}:
         raise ValueError('只允许 HTTPS 的 gpushare.com 官方域名，不允许其他站点')
-    if parts.username or parts.password or parts.fragment:
-        raise ValueError('URL 不允许包含用户密码或片段')
+    if parts.username or parts.password or parts.fragment or parts.port not in (None, 443):
+        raise ValueError('URL 不允许包含用户密码、片段或非默认端口')
     segments = {p.lower().replace('_', '-') for p in parts.path.split('/') if p}
     if any(p in UNSAFE_PATH_PARTS for p in segments):
         raise ValueError('拒绝访问疑似修改实例状态的接口')
@@ -96,9 +103,11 @@ def fetch_json(src):
         headers['Content-Type'] = 'application/json'
     request = Request(src['url'], data=data, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=12) as response:
+        with build_opener(NoRedirect()).open(request, timeout=12) as response:
             body = response.read(MAX_RESPONSE + 1)
     except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise ProbeError('接口重定向：可能需要网页登录；为防止 Cookie 泄漏，拒绝自动跳转') from exc
         if exc.code in (401, 403):
             raise ProbeError('登录态失效或无访问权限') from exc
         if exc.code == 429:
@@ -141,6 +150,44 @@ def evaluate(data, cfg):
     if isinstance(count, bool) or not (type(count) is int and count >= 0):
         raise ProbeError('空闲显卡数不是非负整数，不能确认库存')
     return count >= target['gpu_count'], count
+
+
+def inspect_json(data, machine_id):
+    """Show only structural hints, never sample values or confidential fields."""
+    matches = []
+    visited = 0
+
+    def walk(obj, path='', depth=0):
+        nonlocal visited
+        visited += 1
+        if visited > 5000 or depth > 12 or len(matches) >= 10:
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if not isinstance(key, str):
+                    continue
+                if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value) == machine_id:
+                    candidates = sorted(k for k, val in obj.items()
+                        if isinstance(k, str) and isinstance(val, int) and not isinstance(val, bool)
+                        and any(word in k.lower() for word in ('free', 'avail', 'idle', 'stock', 'remain', 'left')))
+                    matches.append((path or '(root)', key, candidates))
+            for key, value in obj.items():
+                if isinstance(key, str) and isinstance(value, (list, dict)):
+                    walk(value, f'{path}.{key}' if path else key, depth+1)
+        elif isinstance(obj, list):
+            for idx, item in enumerate(obj[:300]):
+                if isinstance(item, (list, dict)):
+                    walk(item, f'{path}.{idx}' if path else str(idx), depth+1)
+
+    walk(data)
+    if not matches:
+        return ('没有找到与目标 machine_id 完全一致的机器记录。'
+                '可能是接口不包含目标主机、需要登录或字段不是直接字符串，不能作为库存来源。')
+    lines = [f'发现 {len(matches)} 个可能的机器 ID 对应记录（只显示字段名，不显示数据）：']
+    for path, key, candidates in matches:
+        lines.append(f'路径: {path}  ID字段: {key}  候选库存字段名: {candidates or "未发现"}')
+    lines.append('注意：候选字段须人工核对业务含义；仅有记录不代表可开机，不能自动启用监控。')
+    return '\n'.join(lines)
 
 
 def smtp_config():
@@ -273,9 +320,10 @@ def process_lock(state_path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='GPUShare 只读候补监测及邮件通知')
-    parser.add_argument('command', choices=['check', 'once', 'monitor', 'test-mail'])
+    parser.add_argument('command', choices=['check', 'once', 'monitor', 'test-mail', 'inspect-json'])
     parser.add_argument('--config', default='config.json')
     parser.add_argument('--state', default='state/state.json')
+    parser.add_argument('--sample-file', help='离线 JSON 样本，仅用于 inspect-json；不联网、不发邮件')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.command == 'test-mail':
@@ -283,6 +331,15 @@ def main(argv=None):
         LOG.info('邮件测试发送成功')
         return 0
     cfg = json.loads(Path(args.config).read_text(encoding='utf-8'))
+    if args.command == 'inspect-json':
+        if not args.sample_file:
+            raise ValueError('inspect-json 需要 --sample-file 文件路径')
+        sample_path = Path(args.sample_file)
+        if sample_path.stat().st_size > MAX_RESPONSE:
+            raise ValueError('样本文件超过 1 MiB，不予处理')
+        data = json.loads(sample_path.read_text(encoding='utf-8'))
+        print(inspect_json(data, str(cfg['target']['machine_id'])))
+        return 0
     validate(cfg)
     if args.command == 'check':
         avail, free = evaluate(fetch_json(cfg['source']), cfg)
