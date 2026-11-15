@@ -1,181 +1,346 @@
-# GPUShare Monitor — 仅监测与邮件提醒
+# GPUShare Monitor
 
-针对你所需的 **4080s-32G × 1** 监测 GPUShare 云市场中的**任意机器**。只要有至少一台机器满足空闲卡数及按量计费条件，就发送邮件，由你自行登录网站查看并开机。不再绑定某个 `machineId`，也不限制地区。**绝不自动登录、开机、购买、充值、停止或修改实例。** 使用 Python 标准库运行，不需要 Docker。
+GPUShare GPU 库存监控与邮件提醒工具。选择显卡型号或指定机器，发现满足条件的空闲 GPU 后发送邮件，由使用者在网页中手动确认和开机。
 
-## 当前进度与限制
+使用 Python 标准库，无需安装第三方依赖；支持前台运行和 Linux systemd 部署，不需要 Docker，也不监听公网端口。程序只查询市场库存，不会自动登录、刷新登录凭据、创建实例、启动实例或执行付费操作。
 
-- ✅ 已根据 2026-10-23 的实际浏览器请求确认：`GET https://api.gpushare.com/app/api/market/machine/list`；并根据真实响应确认字段 `data.list`、`data.total`、`machineId`、`gpuName`、`gpuNum`、`gpuUsed`、`regionName`、`isOnline`、`status` 和 `skuList`。
-- ✅ 采用 `gpuNum - gpuUsed` 计算该主机**市场可见的空闲数量**，按显卡型号筛选所有机器，并检查每台机器的空闲卡数、在线状态及按量计费 SKU；自动翻页，避免只看第 1 页漏报。
-- ✅ 可用时发一封邮件，持续可用时不重复发送。该型号两次在**完整市场列表**中无可用候选资源之后，可以再次触发提醒。错误或请求失败一律不发送“有卡”邮件。
-- ⚠️ **还没有通过你的账号实测该接口是否需要 Bearer 登录态，以及市场可见空闲 GPU 是否允许你的已有实例成功开机。** 因而完成代码和模拟测试，不等于已经开通真实监控。云市场可租不保证“已有实例”一定能成功启动。
-- ⚠️ 先前截图中曾显示完整 `Authorization: Bearer`，请撤销/更新那份登录会话。**不要把 Token、Cookie、API 响应中的个人资料提交到仓库、聊天或 Issues。**
+## 功能
 
-## 监控范围：按显卡型号，不限主机/地区
+- **两种匹配方式**：按显卡型号查找任意机器，或同时匹配机器 ID 和显卡型号。
+- **多个监控目标**：可以监控不同型号、不同机器，每个目标分别去重和判断重新上架。
+- **完整分页检查**：避免只查第一页；分页不完整、数据异常或认证失败时不发送有卡提醒。
+- **邮件通知**：包含型号、机器 ID、地区、符合条件的空闲数量及手动访问入口。
+- **登录态失效提醒**：首次检测到认证失败时立即尝试发送邮件，避免把查询失败误认为没有库存。
+- **邮件暂停/恢复**：点击邮件中的控制链接、手动发送预填邮件后，统一暂停或恢复全部监控目标。
+- **持久化状态**：重启后保留去重记录、暂停状态和邮件控制游标。
 
-默认模板 `config.my-instance.example.json` 已更新为：
+## 运行要求
 
-| 属性 | 值 |
-|---|---|
-| `target.match_mode` | `gpu_model`（不匹配机器 ID） |
-| GPU | `4080s-32G` × 1 |
-| 地区 | **不限**：所有响应中符合型号的地区 |
-| 触发条件 | **任意一台**机器在线、按量 `payg` 可用且 `gpuNum - gpuUsed >= 1` |
+- Python 3.10 或更新版本；运行环境为 Linux。
+- 能访问 GPUShare 市场接口，以及配置的 SMTP 服务。
+- 若启用邮件控制，需要邮箱支持 IMAP SSL。
+- 若接口要求认证，需要使用者自行获取有效 Bearer Token。
+- 使用后台部署和快捷 Token 更新功能时，需要 systemd 及管理该服务的权限。
 
-**注意：** 你原先的按量实例有可能与物理宿主机绑定。其他机器有同型号的可租显卡，只能说明市场上有该 GPU 的候选库存，**不能保证旧实例能在另一台机器启动**。如果你实际可以迁移/重新创建同配置实例，型号监控更符合目标；但监控程序本身不会执行任何实例操作。GPUShare [官方迁移文档](https://gpushare.com/docs/instance/migration/) 介绍了手动迁移至同型号 GPU 主机的方法，且提醒迁移会清除 `/hy-tmp`；如需迁移，请先备份重要数据。
+这是基于市场列表接口实现的工具。接口字段、访问权限和登录会话策略可能变化，部署时应先验证响应与网页显示一致。邮件中的库存是查询时的快照，不保证收到邮件时仍可租用，也不保证已有实例能在对应机器启动。
 
-假如两台目标型号机器各有 1 张空闲卡，邮件报告为“2 台候选主机、合计 2 张”；如果需要 2 张则必须**同一台机器**至少 2 张空闲，不能跨机器拼凑。机器名称/机器 ID 只在邮件中作为可参考信息，不参与库存匹配条件。
-
-## 一、安装和配置
+## 快速开始
 
 ```bash
 git clone https://github.com/WXW-EXPLORE/gpushare_monitor.git
 cd gpushare_monitor
-cp config.my-instance.example.json config.json
 cp .env.example .env
+```
+
+接下来创建 `config.json` 并填写 `.env`。配置完成后设置私有文件权限：
+
+```bash
 chmod 600 config.json .env
-python3 -m unittest discover -s tests -v
+mkdir -p state
+chmod 700 state
 ```
 
-模板中的 `source.kind=gpushare_market` 和 `confirmed_read_only=true` 只允许已观察到的那个只读 `GET /app/api/market/machine/list`。仅允许 HTTPS 官方域名、禁止重定向；任何登录失效、响应业务 `status != 0`、分页不完整或关键字段格式异常，都不会触发有卡提醒。
+### 1. 选择监控目标
 
-`source.max_pages` 默认 30，`ps=10` 每页最多 10 条。程序先检查 `data.total` 再依次请求每一页；结果不完整或中途变化均视为 `UNKNOWN`。如果总页数经常很多，应延长轮询间隔、与平台确认合适的请求频率。
+以下以 `4090-48G` 为例，型号可换成接口实际返回的其他名称。请使用准确的型号字符串；主目标的 `target.gpu_model` 与查询 URL 中的 `gpuName` 必须一致。
 
-## 二、由你自己完成登录（仅当必要时）
-
-先在**不保存任何账号信息**的状态下测试该 API 是否支持匿名只读查询：
-
-```bash
-python3 gpushare_monitor.py check --config config.json
-```
-
-如果返回 `AVAILABLE` / `UNAVAILABLE` / `NOT_LISTED`，说明请求获取了格式正确的结果；仍需人工确认与你网页看到的库存一致。`NOT_LISTED` 不代表真实剩余量是 0。
-
-如果输出 `HTTP 401/403` 或业务状态失败，说明可能需要登录态。此时你自己在浏览器完成登录并从 `Network → Headers` 获取**新的** `Authorization`；不需要向开发者或 AI 发送该令牌，也不要复制旧截图中的令牌。在服务器本地 `.env` 增加：
-
-```bash
-GPUSHARE_READ_AUTHORIZATION="Bearer YOUR_NEW_PRIVATE_TOKEN"
-```
-
-随后**只在本机**编辑 `config.json` 的 `source.headers`：
+**按型号监控任意机器**：将以下内容保存为 `config.json`。
 
 ```json
-"headers": { "Authorization": "env:GPUSHARE_READ_AUTHORIZATION" }
+{
+  "target": {
+    "match_mode": "gpu_model",
+    "gpu_model": "4090-48G",
+    "gpu_count": 1,
+    "console_url": "https://gpushare.com/"
+  },
+  "poll_seconds": 30,
+  "source": {
+    "kind": "gpushare_market",
+    "confirmed_read_only": true,
+    "url": "https://api.gpushare.com/app/api/market/machine/list?models=-1&gpuName=4090-48G&priceOrder=asc&pn=1&ps=10&minGpuNum=1&maxGpuNum=24&vmType=docker&tag=",
+    "method": "GET",
+    "headers": {
+      "Authorization": "env:GPUSHARE_READ_AUTHORIZATION"
+    },
+    "max_pages": 30
+  }
+}
 ```
 
-此处是手动保存已经登录会话的必要凭据，并非程序替你登录；**只有在平台允许使用会话进行只读轮询时才这样做**。如果不愿存储令牌，且匿名接口不可用，就不能稳定实现全天候监控。令牌失效后自行重新登录并替换；程序不会自动获取或刷新凭据。
+**只监控指定机器**：将上述 `target` 对象替换为以下内容，并填写自己的机器 ID。
 
-`test-mail`、`check` 等命令若在 shell 中手工运行，需要先从私有 `.env` 导入环境变量：
-
-```bash
-set -a; . ./.env; set +a
+```json
+{
+  "match_mode": "machine",
+  "machine_id": "YOUR_MACHINE_ID",
+  "gpu_model": "4090-48G",
+  "gpu_count": 1,
+  "console_url": "https://gpushare.com/"
+}
 ```
 
-## 三、配置邮件，试运行
+**增加其他目标**：在 `config.json` 根对象中增加 `additional_targets` 字段。例如，保留主目标并额外监控一台 A6000 机器：
 
-编辑本机 `.env`，填写自己的 SMTP 邮箱信息（可以使用邮箱提供商的专用 SMTP 授权码，**不要填网页登录密码**）：
+```json
+{
+  "additional_targets": [
+    {
+      "match_mode": "machine",
+      "machine_id": "YOUR_SECOND_MACHINE_ID",
+      "gpu_model": "A6000-48G",
+      "gpu_count": 1,
+      "console_url": "https://gpushare.com/"
+    }
+  ]
+}
+```
 
-```text
-SMTP_HOST=smtp.qq.com
+这段是需要合并到原配置中的字段，不是独立配置文件。新增目标也可以使用 `gpu_model` 模式；每个新增目标的型号查询参数由程序生成，无需为它单独填写 URL。同一机器 ID 不能重复作为精确目标添加；按型号监控时，同一型号不能重复添加。
+
+| 配置项 | 含义 |
+|---|---|
+| `match_mode` | `machine` 精确匹配机器；`gpu_model` 匹配该型号的任意机器 |
+| `machine_id` | `machine` 模式必填，来自平台返回的机器 ID |
+| `gpu_model` | 接口中的 GPU 型号名称，注意大小写和后缀 |
+| `gpu_count` | 同一台机器至少需要的空闲 GPU 数，不能跨机器相加满足条件 |
+| `console_url` | 通知邮件中的手动访问入口 |
+| `poll_seconds` | 基础轮询周期，至少 30 秒；每轮另加 0–10 秒随机间隔 |
+| `max_pages` | 每个型号的最大查询页数，默认 30；超过上限视为结果不完整 |
+
+查询 URL 中的 `minGpuNum`、`maxGpuNum` 也会影响返回范围，应按需求调整，避免把目标资源过滤掉。型号包含空格等特殊字符时，URL 中的 `gpuName` 需要进行 URL 编码。
+
+当前按 `gpuNum - gpuUsed` 计算市场可见空闲数量，同时检查机器在线、状态正常且按量计费 `payg` SKU 可用。精确机器模式下，其他机器有空闲卡不会触发通知。
+
+### 2. 配置 GPUShare 凭据
+
+如果只读接口要求认证，在自己的浏览器登录 GPUShare，打开开发者工具的 **Network / 网络**，找到市场列表 `machine/list` 请求，查看请求头中的 `Authorization`。
+
+仅在本机 `.env` 中填写：
+
+```dotenv
+GPUSHARE_READ_AUTHORIZATION="Bearer YOUR_PRIVATE_TOKEN"
+```
+
+`config.json` 中只保存 `env:GPUSHARE_READ_AUTHORIZATION` 这样的环境变量引用。若已确认接口支持匿名查询，可将 `source.headers` 设为 `{}`，无需配置 Token。
+
+网页会话可能过期或被撤销；程序不会自动登录或续期。不要把真实 Token 放入命令行参数、提交到仓库或贴到聊天、Issues 中。
+
+### 3. 配置 SMTP
+
+在 `.env` 中填写自己邮箱服务商提供的 SMTP 参数。以下地址为占位示例：
+
+```dotenv
+SMTP_HOST=smtp.example.com
 SMTP_PORT=465
-SMTP_FROM=your_account@qq.com
-SMTP_TO=destination@example.com
-SMTP_USER=your_account@qq.com
-SMTP_PASSWORD=YOUR_SMTP_APP_PASSWORD
+SMTP_FROM=monitor@example.com
+SMTP_TO=you@example.com
+SMTP_USER=monitor@example.com
+SMTP_PASSWORD="YOUR_SMTP_APP_PASSWORD"
 ```
 
+端口 465 使用 SMTP SSL，其他端口使用 STARTTLS。`SMTP_USER` 和 `SMTP_PASSWORD` 需同时设置或同时留空；使用邮箱账号认证时，按服务商要求填写专用授权码。
+
+程序不会自动加载 `.env`，手动执行命令前需在项目目录导入配置。修改文件后也需要重新导入：
+
 ```bash
-python3 gpushare_monitor.py test-mail
+set -a
+. ./.env
+set +a
+```
+
+### 4. 验证后再启动
+
+先运行离线测试、只读检查和测试邮件：
+
+```bash
+python3 -m unittest discover -s tests -v
 python3 gpushare_monitor.py check --config config.json
-python3 gpushare_monitor.py once --config config.json
+python3 gpushare_monitor.py test-mail
+```
+
+`check` 会分别检查所有目标，不发库存邮件、不修改云端数据。请核对网页中的型号、机器 ID、空闲数量，并确认测试邮件确实收到。接口返回认证失败或无法解释的结果时，先解决问题再启用正式通知。
+
+验证通过后可前台运行：
+
+```bash
 python3 gpushare_monitor.py monitor --config config.json
 ```
 
-- `test-mail` 只发送测试邮件，与 GPU 库存无关；
-- `check` 只检查一次，不发邮件、不更改云端状态；
-- `once` 只检查一次，如果观察到至少一台同型号机器满足条件才发送邮件；
-- `monitor` 循环监测（默认 60 秒加 0–10 秒随机间隔，失败时退避，最长 15 分钟）。
+按 `Ctrl+C` 结束前台运行，再按下文部署后台服务。
 
-邮件主题为「4080s 型号出现候选空闲 GPU，请手动检查」。邮件中的空闲数量是云市场快照，随时可能变化。
+## 运行命令与通知规则
 
-## 四、在已有轻量服务器独立部署
+| 命令 | 用途 |
+|---|---|
+| `check --config config.json` | 每个目标做一次完整只读检查，不发送库存邮件 |
+| `once --config config.json` | 检查一轮，按库存和去重状态发送通知 |
+| `monitor --config config.json` | 持续监测，可配合 IMAP 控制 |
+| `test-mail` | 发送一封与库存无关的测试邮件 |
+| `test-control` | 发送带暂停链接的控制测试邮件，需要启用邮件控制 |
+| `inspect-live --config config.json` | 只读诊断响应结构，不打印原始字段值 |
 
-将 `systemd/gpushare-monitor.service.example` 复制为系统服务配置，把 `REPLACE_USER` 和 `REPLACE_PROJECT_PATH` 改为实际用户名和项目目录。**不要重启 Nginx、Docker 或任何已有网站、邮件服务。**
+以上命令均使用 `python3 gpushare_monitor.py` 调用。默认状态文件为 `state/state.json`，可用 `--state` 指定其他路径。
 
-```bash
-sudo cp /tmp/gpushare-monitor.service /etc/systemd/system/gpushare-monitor.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now gpushare-monitor.service
-systemctl status gpushare-monitor.service
-journalctl -u gpushare-monitor.service -f
-# 停止：sudo systemctl stop gpushare-monitor.service
-```
+正常每轮约 30–40 秒，处理耗时计入周期；多目标时每轮分别查询各型号并遍历分页。接口变慢或查询失败时周期会延长，异常退避最长 15 分钟。
 
-systemd 从私有 `.env` 注入凭据，监控进程不保存原始接口响应及 Token。`state/state.json` 持久化邮件去重状态，文件锁避免同一实例多个进程重复提醒。连续 5 次探测失败可以每 6 小时发一次异常提醒。
+- 每个目标第一次满足条件时发邮件，持续可用时不重复发送。
+- 连续两次完整扫描均无符合条件的资源后，该目标重新具备提醒资格；查询异常不会被当作无库存来重置状态。
+- 多目标分别记录状态，一台的持续可用不会阻止另一台重新上架提醒；单台查询或库存邮件发送失败，不跳过同轮其他目标。
+- 首次发现 HTTP 或业务状态 401/403 时，立即尝试发送认证失败提醒；持续失败每 6 小时最多提醒一次，成功查询后允许下一次认证失败重新提醒。
+- 其他查询错误连续出现 5 次后，每 6 小时最多发送一次异常提醒。SMTP 本身故障时通知无法保证送达，需结合日志检查。
 
-建议先只运行 `check`，确认解析结果与网页同型号库存一致，再运行 `monitor`。若日志反复显示 `UNKNOWN`，不要误认为平台真的没有显卡。
+## 邮件暂停与恢复（可选）
 
-## 五、故障与风险说明
+该功能通过 SMTP/IMAP 收发控制邮件，不需要域名、网页控制服务或入站端口。
 
-- `NOT_LISTED`：完整市场列表中没有返回所需型号的机器。不表示你原来那台实例必然不可开机。
-- `UNKNOWN`：接口失败、登录态过期、分页被截断、市场变化或字段异常。保守处理，不发送有卡邮件。
-- `AVAILABLE`：完整市场列表中至少有一台同型号机器空闲数量满足要求、在线且 payg SKU 可用，**不保证已关机实例启动成功**。
-- 由于 GPU 极易被他人抢走，邮件发出时库存可能已经变化；这是通知方案的自然限制。
-- `.env`、`config.json`、Token 和 Cookie 均不得提交到 GitHub；运行前遵守 GPUShare 的接口与使用规则。
-- 关机实例的到期、系统盘和 `/hy-tmp` 数据保留条件以你控制台显示的现行规则为准，重要研究资料请单独备份。
-
-## 六、测试
-
-```bash
-python3 -m unittest discover -s tests -v
-python3 -m py_compile gpushare_monitor.py
-```
-
-本地测试使用合成的 JSON 响应，包括你提供的 TITAN X 示例中 `gpuNum=7, gpuUsed=6` 的字段逻辑，不需要也不会使用你的任何个人登录令牌。
-
-## 七、邮件控制：点击邮件里的链接暂停/恢复（无需新域名或公网端口）
-
-可选功能，不改变 GPUShare 实例、不会代替你登录或开机。**为不修改现有服务器的网站、反向代理或防火墙，本项目采用 `mailto:` 控制邮件，而不是公开网页上的一键 GET 操作。**
-
-**实际使用步骤：**
-
-1. 云市场出现候选 4080s-32G 时，通知邮件末尾显示「点此发送监控控制邮件」链接（邮件应用支持 HTML 时可直接点击）。
-2. 点击后，手机/电脑默认邮件 App 打开一封**预填好的邮件**，收件人是监控邮箱，主题是一条有签名、48 小时内有效的 `GPUCTRL PAUSE ...` 指令。**你需要自己点击“发送”才会暂停**，邮件预览/链接扫描不会改变状态。
-3. Linux 后台大约每 60 秒通过 IMAP 只读检查新邮件（**不设已读、不删除邮件**）。仅当发件人是你在 `CONTROL_AUTHORIZED_FROM` 填写的地址且 HMAC 签名有效才接受暂停。暂停后不会再请求 GPUShare，只轮询邮箱中的「恢复」指令。
-4. 程序发出「监测已暂停」确认邮件，其中含新的「恢复监测」链接。点击后**发送**预填邮件即可恢复库存监测。
-
-**额外配置**：在服务器本机 `.env` 填入以下环境变量（不要提交 GitHub）：
+在 `.env` 中增加以下配置：
 
 ```dotenv
-IMAP_HOST=imap.qq.com
+IMAP_HOST=imap.example.com
 IMAP_PORT=993
-IMAP_USER=your_account@qq.com
-IMAP_PASSWORD=YOUR_IMAP_APP_PASSWORD
-CONTROL_AUTHORIZED_FROM=your_notification_recipient@example.com
-CONTROL_SECRET=GENERATE_A_NEW_PRIVATE_SECRET
+IMAP_USER=monitor@example.com
+IMAP_PASSWORD="YOUR_IMAP_APP_PASSWORD"
+CONTROL_AUTHORIZED_FROM=you@example.com
+CONTROL_SECRET=REPLACE_WITH_A_RANDOM_SECRET
 ```
 
-- `IMAP_USER`：邮件监控程序自己的**收件邮箱**。通常与 `SMTP_FROM` 相同。需在服务商中启用 IMAP 并使用专用邮箱授权码；IMAP 授权码不是 GPUShare 登录密码。
-- `CONTROL_AUTHORIZED_FROM`：你在手机上回复控制邮件时使用的**发件邮箱**，通常与你收到提醒的 `SMTP_TO` 相同；如果邮箱客户端实际使用别名，应填准确发件地址。
-- `CONTROL_SECRET`：在服务器上执行 `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` 生成，保持私密（最少 32 字节）。只在本地 `.env` 保存。**保留此值，以免旧控制邮件失效。**
-- `.env` 中 **五个必填参数必须全部提供** 才启用邮件控制；一个都不填写则保持原有普通邮件提醒，无链接和 IMAP 轮询。
-- 首次启动时 IMAP 只记录邮箱内最新 UID，不处理历史邮件（防止旧指令突然生效）；因此**先开启监控，再发送第一封控制邮件**。邮箱重置也重新从最新 UID 开始。
-- 不要转发带控制链接的邮件；指令一次有效，使用后不能再重放。令牌 48 小时过期，邮箱出错只记录错误、不自行暂停或恢复。
+`IMAP_USER` 是程序监听的收件箱。`CONTROL_AUTHORIZED_FROM` 是允许发送控制指令的邮箱地址，应与邮件客户端实际发件地址一致。IMAP 使用 SSL；授权码和服务器地址以邮箱服务商设置为准。
 
-**部署说明：** 沿用已有 `gpushare-monitor.service`，只需按上述方式配置环境变量并**重启这个监控单独的服务**，不需要更改 Nginx、数据库、域名、其他定时任务或邮件发送程序。
+在服务器本地生成控制密钥，并将输出保存到 `.env` 的 `CONTROL_SECRET` 中：
 
 ```bash
-sudo systemctl restart gpushare-monitor.service
-journalctl -u gpushare-monitor.service -n 40 --no-pager
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-当监控已暂停，进程仍然运行但**不查询 GPU 库存、不发送有卡提醒**，这样才能接收后续恢复邮件；如果你想完全停用所有轮询（包括邮箱），仍可运行 `sudo systemctl stop gpushare-monitor.service`。此时邮件中的恢复指令将无法生效，必须先从服务器重新启动。
+密钥至少 32 字节，保存后保持不变。除端口有默认值外，上述控制参数必须全部提供；完全不填写则禁用邮件控制。修改后重启监控进程，使配置生效。
 
-**测试：** `python3 -m unittest discover -s tests -v` 含 HMAC 签名、48 小时失效、陌生发件人拒绝、历史邮件跳过、IMAP 游标持久化、暂停/恢复与重复命令防重放的离线测试。**尚未连接真实邮箱进行收发联调，需要你在自己的服务器完成 IMAP/SMTP 配置与一次邮件控制演练。**
+操作流程：
 
-若不想等到 GPU 有货才演练，可以在**监控服务已经运行且 IMAP 首次初始化成功后**，在导入本地 `.env` 的 shell 中执行：
+1. 点击库存通知或控制测试邮件中的链接，邮件客户端会打开一封预填邮件。
+2. 手动点击“发送”；程序校验发件地址、有效期及 HMAC 签名后执行操作。
+3. 暂停成功后收到确认邮件，其中提供恢复链接；点击并发送预填邮件即可恢复。
+
+控制签名位于预填邮件主题中，保持主题不变。它是一次性的控制凭证，不包含 GPUShare Token，48 小时内有效；不要转发含控制链接的邮件。
+
+暂停统一作用于全部目标：停止库存查询，保留 IMAP 监听。恢复后全部目标重新具备库存提醒资格。IMAP 使用只读方式查看收件箱，不设置已读或删除邮件；首次初始化跳过已有邮件，因此要先启动服务，再发送控制指令。
+
+测试邮件控制时，在服务已启动、IMAP 已初始化后运行：
 
 ```bash
 python3 gpushare_monitor.py test-control
 ```
 
-程序将寄出标题包含「邮件暂停控制测试」的模拟控制邮件，**并不声称 GPU 有卡**；你点击其中的控制链接发送预填邮件，检查日志显示 `PAUSED` 并确认收到暂停回执；随后点击回执中的恢复链接发信，日志应继续记录 GPU 检测。
+手动发送暂停指令，确认收到暂停回执且日志显示 `PAUSED`；再发送恢复指令，确认恢复回执和后续库存查询。该测试邮件不代表发现空闲 GPU。
+
+## 使用 systemd 后台部署
+
+在普通 Linux 用户下完成配置和前述验证，结束前台监控后，运行以下命令。服务中的路径和用户会根据当前项目目录自动填写：
+
+```bash
+project_dir="$(pwd -P)"
+run_user="$(id -un)"
+run_group="$(id -gn)"
+python_path="$(command -v python3)"
+unit_file="$(mktemp)"
+mkdir -p state
+chmod 700 state
+chmod 600 .env config.json
+
+cat > "$unit_file" <<EOF
+[Unit]
+Description=GPUShare read-only GPU market monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${run_user}
+Group=${run_group}
+WorkingDirectory=${project_dir}
+EnvironmentFile="${project_dir}/.env"
+ExecStart="${python_path}" "${project_dir}/gpushare_monitor.py" monitor --config "${project_dir}/config.json" --state "${project_dir}/state/state.json"
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths="${project_dir}/state"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo install -m 644 "$unit_file" /etc/systemd/system/gpushare-monitor.service
+rm -- "$unit_file"
+sudo systemctl daemon-reload
+sudo systemctl enable --now gpushare-monitor.service
+```
+
+该服务启用开机启动、异常退出重启，并将日志写入 journal。程序只连接配置中的外部服务，无需更改已有网站、反向代理或邮件服务。也可参考 `systemd/gpushare-monitor.service.example`，替换其中的用户、组和目录后安装。
+
+常用操作：
+
+```bash
+# 查看服务和日志
+sudo systemctl status gpushare-monitor.service
+sudo journalctl -u gpushare-monitor.service -n 50 --no-pager
+sudo journalctl -u gpushare-monitor.service -f
+
+# 完全停止，包括 IMAP 监听
+sudo systemctl stop gpushare-monitor.service
+
+# 启动进程；已保存的邮件暂停状态仍然有效
+sudo systemctl start gpushare-monitor.service
+
+# 修改配置或凭据后重新加载
+sudo systemctl restart gpushare-monitor.service
+```
+
+`active (running)` 只表示进程在运行；还需查看是否为 `PAUSED`、是否有新的查询记录以及接口状态。
+
+## 快捷更新 Token
+
+已安装上述 systemd 服务后，在项目目录运行：
+
+```bash
+python3 update_token.py
+```
+
+在隐藏输入提示中粘贴新 Token 并回车。可粘贴纯 Token、`Bearer ...` 或完整的 `Authorization: Bearer ...`。脚本会先验证所有目标的只读查询，通过后自动替换 `.env` 中的旧值、保持权限 `600`，并重启 `gpushare-monitor.service`。验证失败保留旧配置；保存成功但重启失败时，会提示手动重启。
+
+快捷命令使用脚本所在项目目录的 `.env` 和 `config.json`，并要求配置中的 Authorization 引用 `env:GPUSHARE_READ_AUTHORIZATION`。重启会保留邮件暂停状态，不会自动解除暂停。前台运行模式可手动编辑 `.env`，重新导入环境变量后再启动进程。
+
+## 状态与排查
+
+| 状态 | 含义与处理 |
+|---|---|
+| `AVAILABLE` | 对应目标有满足条件的候选库存；到网页手动确认 |
+| `UNAVAILABLE` | 目标已返回，但当前没有满足租用条件的空闲卡 |
+| `NOT_LISTED` | 完整筛选结果没有该型号或指定机器；可能因库存筛选而未返回，不等同于准确剩余量为零 |
+| `AUTH_FAILED` | 认证失效或权限不足；手动获取有效 Token 并更新 |
+| `UNKNOWN` | 网络、业务响应、字段或分页异常；无法确认库存 |
+| `NOTIFICATION_FAILED` | 库存邮件发送失败；检查 SMTP 设置及日志 |
+| `PAUSED` | 库存查询已暂停，仍监听恢复邮件 |
+
+`check` 命令中的认证错误以 `UNKNOWN` 和具体原因输出；守护进程会单独记录 `AUTH_FAILED` 并触发告警。
+
+收不到控制回执时，先确认邮件已发往 `IMAP_USER`、发件地址与 `CONTROL_AUTHORIZED_FROM` 一致、主题未改动且签名未过期。库存异常退避期间，控制邮件检查也可能延后。
+
+如果暂停超过 48 小时、恢复链接已经过期，可启动服务、导入 `.env`，在本机重新发送一封恢复链接邮件，再通过邮件客户端手动确认发送：
+
+```bash
+python3 - <<'PY'
+from email_control import read_control_config, control_section
+from gpushare_monitor import send_mail
+control = read_control_config()
+if control is None:
+    raise SystemExit('请先启用邮件控制')
+send_mail('GPUShare：新的恢复监控链接', control_section('resume', control))
+PY
+```
+
+接口和 SMTP/IMAP 联调完成前，不应仅凭进程在运行就认定部署成功。日常分享仓库时保留示例配置即可，勿提交 `.env`、真实 `config.json`、状态文件或原始接口响应。

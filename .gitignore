@@ -1,0 +1,10 @@
+.env
+config.json
+state/
+__pycache__/
+tests/__pycache__/
+*.py[cod]
+.*.sw?
+.env-update-*
+DEPLOYMENT.md
+systemd/gpushare-monitor.service

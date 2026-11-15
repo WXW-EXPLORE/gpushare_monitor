@@ -101,10 +101,10 @@ class MonitorTests(unittest.TestCase):
     def test_screenshot_instance_target(self):
         cfg_path = Path(__file__).resolve().parent.parent/'config.my-instance.example.json'
         cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
-        self.assertEqual(cfg['target']['gpu_model'], '4080s-32G')
+        self.assertEqual(cfg['target']['gpu_model'], '4090-48G')
         self.assertEqual(cfg['target']['gpu_count'], 1)
-        self.assertEqual(cfg['target']['match_mode'], 'gpu_model')
-        self.assertNotIn('machine_id', cfg['target'])
+        self.assertEqual(cfg['target']['match_mode'], 'machine')
+        self.assertEqual(cfg['target']['machine_id'], 'YOUR_MACHINE_ID')
         self.assertNotIn('region', cfg['target'])
         self.assertTrue(cfg['source']['confirmed_read_only'])
         self.assertEqual(cfg['source']['kind'], 'gpushare_market')
@@ -150,7 +150,7 @@ class MonitorTests(unittest.TestCase):
         cfg = json.loads((Path(__file__).resolve().parent.parent /
                           'config.my-instance.example.json').read_text(encoding='utf-8'))
         self.assertTrue(cfg['source']['confirmed_read_only'])
-        self.assertIn('gpuName=4080s-32G', cfg['source']['url'])
+        self.assertIn('gpuName=4090-48G', cfg['source']['url'])
         self.assertIn('ps=10', cfg['source']['url'])
         self.assertEqual(cfg['source']['method'], 'GET')
         validate(cfg)
@@ -345,6 +345,7 @@ class GpuModelMatchingTests(unittest.TestCase):
                            notify=lambda subject, content: sent.append((subject, content)))
         self.assertIn('AVAILABLE', msg)
         self.assertEqual(len(sent), 1)
+        self.assertIn('TITAN X-12G', sent[0][0])
         self.assertIn('TITAN X-12G', sent[0][1])
         self.assertIn('not-the-old-machine', sent[0][1])
         self.assertNotIn('目标机器：', sent[0][1])
@@ -366,6 +367,46 @@ class GpuModelMatchingTests(unittest.TestCase):
         cfg['target']['match_mode'] = 'gpu_model'
         with self.assertRaises(ValueError):
             validate(cfg)
+
+    def test_switching_gpu_model_rearms_alert_and_preserves_mail_control_state(self):
+        cfg = json.loads((Path(__file__).resolve().parent.parent /
+                          'config.my-instance.example.json').read_text())
+        row = market_record(machine_id=cfg['target']['machine_id'])
+        row['gpuName'] = '4090-48G'
+        state = {'signature': 'old-model-signature', 'alerted': True,
+                 'paused': False, 'imap_last_uid': 100, 'imap_uidvalidity': '1',
+                 'used_control_tokens': ['previous-command-hash']}
+        sent = []
+        result, msg = cycle(cfg, state, probe=lambda _: market_response([row]),
+                            notify=lambda *args: sent.append(args))
+        self.assertEqual(msg, 'AVAILABLE: mail sent')
+        self.assertEqual(len(sent), 1)
+        self.assertIn('4090-48G', sent[0][0])
+        self.assertNotIn('4080', sent[0][0])
+        self.assertIn('4090-48G', result['signature'])
+        for key in ('paused', 'imap_last_uid', 'imap_uidvalidity', 'used_control_tokens'):
+            self.assertEqual(result[key], state[key])
+
+    def test_configured_machine_excludes_other_idle_4090_hosts(self):
+        cfg = json.loads((Path(__file__).resolve().parent.parent /
+                          'config.my-instance.example.json').read_text())
+        wanted = market_record(machine_id=cfg['target']['machine_id'], used=7)
+        other = market_record(machine_id='unrelated-idle-host', used=0)
+        for row in (wanted, other):
+            row['gpuName'] = cfg['target']['gpu_model']
+        self.assertEqual(evaluate_market(market_response([wanted, other]), cfg['target']),
+                         (False, 0))
+        sent = []
+        state, _ = cycle(cfg, {}, probe=lambda _: market_response([wanted, other]),
+                         notify=lambda *args: sent.append(args))
+        self.assertEqual(sent, [])
+        wanted['gpuUsed'] = 6
+        state, _ = cycle(cfg, state, probe=lambda _: market_response([wanted, other]),
+                         notify=lambda *args: sent.append(args))
+        self.assertEqual(len(sent), 1)
+        self.assertIn(cfg['target']['machine_id'], sent[0][1])
+        self.assertNotIn('unrelated-idle-host', sent[0][1])
+        self.assertEqual(state['free_gpus'], 1)
 
     def test_market_pages_can_find_another_host(self):
         src = copy.deepcopy(MODEL_CONFIG['source'])

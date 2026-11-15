@@ -1,0 +1,24 @@
+[Unit]
+Description=GPUShare read-only GPU market monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+Group=YOUR_LINUX_GROUP
+WorkingDirectory=/path/to/gpushare_monitor
+EnvironmentFile=/path/to/gpushare_monitor/.env
+ExecStart=/usr/bin/python3 /path/to/gpushare_monitor/gpushare_monitor.py monitor --config /path/to/gpushare_monitor/config.json --state /path/to/gpushare_monitor/state/state.json
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/path/to/gpushare_monitor/state
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,15 @@
 {
   "target": {
-    "match_mode": "gpu_model",
-    "gpu_model": "4080s-32G",
+    "match_mode": "machine",
+    "machine_id": "YOUR_MACHINE_ID",
+    "gpu_model": "4090-48G",
     "gpu_count": 1,
     "console_url": "https://gpushare.com/"
   },
-  "poll_seconds": 60,
+  "poll_seconds": 30,
   "source": {
     "confirmed_read_only": true,
-    "url": "https://api.gpushare.com/app/api/market/machine/list?models=-1&gpuName=4080s-32G&priceOrder=asc&pn=1&ps=10&minGpuNum=1&maxGpuNum=24&vmType=docker&tag=",
+    "url": "https://api.gpushare.com/app/api/market/machine/list?models=-1&gpuName=4090-48G&priceOrder=asc&pn=1&ps=10&minGpuNum=1&maxGpuNum=24&vmType=docker&tag=",
     "method": "GET",
     "headers": {},
     "kind": "gpushare_market",

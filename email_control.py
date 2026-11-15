@@ -96,7 +96,7 @@ def mailto_link(action, cfg, now=None):
         'subject': subject,
         'body': 'GPUShare 监控控制指令：请保持邮件主题不变，点击发送即可。\n'
                 '这是对你自己监控程序的控制，不会启动或购买 GPU。'
-    })
+    }, quote_via=quote)
 
 
 def control_section(action, cfg):
@@ -107,7 +107,7 @@ def control_section(action, cfg):
     return ('\n\n【邮件控制】\n'
             f'点击以下链接 → 邮件应用打开预填邮件 → 由你点击“发送”，即可{label}：\n'
             f'{mailto_link(action, cfg)}\n'
-            '指令在 48 小时内有效；服务器通常在下一次轮询（约 60 秒）处理。\n'
+            '指令在 48 小时内有效；服务器通常在下一次轮询（正常约 30–40 秒）处理。\n'
             '不要转发含控制链接的邮件。')
 
 
@@ -120,6 +120,9 @@ def parse_signed_command(raw, cfg, now=None):
         if parseaddr(str(msg.get('From', '')))[1].lower() != cfg['sender']:
             return None
         subject = str(msg.get('Subject', '')).strip()
+        # Older links encoded spaces as '+'; some mail clients retain them.
+        # URL-safe signed tokens never contain '+', so this preserves the token.
+        subject = subject.replace('+', ' ')
         match = CONTROL_PATTERN.fullmatch(subject)
         if not match:
             return None
@@ -205,6 +208,11 @@ def scan_mail_controls(state, cfg, client_factory=None, now=None):
                     result['paused'] = (action == 'pause')
                     if action == 'resume':
                         result['alerted'] = False
+                        if 'target_states' in result:
+                            result['target_states'] = {
+                                key: {**value, 'alerted': False}
+                                for key, value in result['target_states'].items()
+                            }
                     actions.append(action)
                     result['used_control_tokens'] = (consumed + [fingerprint])[-100:]
             result['imap_last_uid'] = uid

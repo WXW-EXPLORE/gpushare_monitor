@@ -45,6 +45,10 @@ class NotListed(ProbeError):
     """A complete market scan did not list the target. NOT proof of zero idle GPUs."""
 
 
+class AuthenticationError(ProbeError):
+    """An authentication rejection needs an immediate, credential-free alert."""
+
+
 def path_value(root, path):
     if not isinstance(path, str) or not path.strip():
         raise ProbeError('JSON 字段路径未配置')
@@ -59,7 +63,41 @@ def path_value(root, path):
     return value
 
 
+def target_configs(cfg):
+    """Expand the primary target and additive targets into isolated queries."""
+    primary = {k: v for k, v in cfg.items() if k != 'additional_targets'}
+    extra = cfg.get('additional_targets', [])
+    if not isinstance(extra, list) or not all(isinstance(t, dict) for t in extra):
+        raise ValueError('additional_targets 必须是目标对象列表')
+    configs = [primary]
+    if extra and cfg['source'].get('kind') != 'gpushare_market':
+        raise ValueError('多机器监控仅支持官方只读云市场接口')
+    for target in extra:
+        source = dict(cfg['source'])
+        parts = urlsplit(source['url'])
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query['gpuName'] = target.get('gpu_model', '')
+        query['pn'] = '1'
+        source['url'] = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                   urlencode(query), parts.fragment))
+        configs.append({**primary, 'target': dict(target), 'source': source})
+    identities = []
+    for item in configs:
+        target = item['target']
+        mode = target.get('match_mode', 'machine')
+        identity = (mode, str(target.get('machine_id') if mode == 'machine'
+                              else target.get('gpu_model')))
+        if identity in identities:
+            raise ValueError('监控目标重复，请勿重复添加同一机器或型号')
+        identities.append(identity)
+    return configs
+
+
 def validate(cfg):
+    if 'additional_targets' in cfg:
+        for item in target_configs(cfg):
+            validate(item)
+        return
     target, source = cfg['target'], cfg['source']
     mode = target.get('match_mode', 'machine')
     if mode not in ('machine', 'gpu_model'):
@@ -108,9 +146,9 @@ def validate(cfg):
         for field in ('records_path', 'id_path', 'free_path'):
             if not source.get(field):
                 raise ValueError(f'请配置 source.{field}')
-    interval = cfg.get('poll_seconds', 60)
-    if type(interval) is not int or interval < 60:
-        raise ValueError('poll_seconds 至少 60 秒')
+    interval = cfg.get('poll_seconds', 30)
+    if type(interval) is not int or interval < 30:
+        raise ValueError('poll_seconds 至少 30 秒')
 
 
 def env_headers(src):
@@ -143,7 +181,7 @@ def fetch_one_json(src):
         if 300 <= exc.code < 400:
             raise ProbeError('接口重定向：可能需要网页登录；为防止 Cookie 泄漏，拒绝自动跳转') from exc
         if exc.code in (401, 403):
-            raise ProbeError('登录态失效或无访问权限') from exc
+            raise AuthenticationError('登录态失效或无访问权限') from exc
         if exc.code == 429:
             raise ProbeError('平台限流（HTTP 429）') from exc
         raise ProbeError(f'接口 HTTP {exc.code}') from exc
@@ -168,6 +206,8 @@ def market_page_url(url, page):
 
 def validate_market_page(data):
     """Check business success and pagination structure before any inventory evaluation."""
+    if isinstance(data, dict) and data.get('status') in (401, 403, '401', '403'):
+        raise AuthenticationError('云市场认证失败：请更新本地 Token 或检查访问权限')
     if not isinstance(data, dict) or type(data.get('status')) is not int or data['status'] != 0:
         raise ProbeError('云市场返回非成功状态（可能未登录或登录态失效）')
     body = data.get('data')
@@ -485,14 +525,16 @@ def save_state(path, obj):
             os.unlink(tmp)
 
 
+def target_signature(cfg):
+    t = cfg['target']
+    return (f"{t.get('match_mode', 'machine')}:{t.get('machine_id', '')}:"
+            f"{t['gpu_model']}:{t['gpu_count']}:{cfg['source']['url']}")
+
+
 def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
     now = now or datetime.now(timezone.utc).isoformat(timespec='seconds')
     result = dict(state)
-    # State changes with matching mode so old per-machine alerts never suppress
-    # notifications for ANY 4080s-32G supply.
-    t = cfg['target']
-    signature = (f"{t.get('match_mode', 'machine')}:{t.get('machine_id', '')}:"
-                 f"{t['gpu_model']}:{t['gpu_count']}:{cfg['source']['url']}")
+    signature = target_signature(cfg)
     if result.get('signature') != signature:
         # Do not discard IMAP watermark or pause state on first market cycle
         # or when changing the monitored GPU model.
@@ -506,6 +548,7 @@ def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
         available, free = evaluate(data, cfg)
     except NotListed:
         result['errors'] = 0
+        result['auth_failure_alerted'] = False
         result['unavailable_streak'] = result.get('unavailable_streak', 0) + 1
         result['last_status'] = 'not_listed'
         result['last_check'] = now
@@ -513,6 +556,13 @@ def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
         if result['unavailable_streak'] >= 2:
             result['alerted'] = False
         return result, 'NOT_LISTED: no matching resource in complete market listing'
+    except AuthenticationError:
+        result['errors'] = result.get('errors', 0) + 1
+        result['unavailable_streak'] = 0
+        result['last_status'] = 'auth_failed'
+        result['last_check'] = now
+        result.pop('free_gpus', None)
+        return result, 'AUTH_FAILED: login session rejected; inventory unknown'
     except (ProbeError, ValueError) as exc:
         result['errors'] = result.get('errors', 0) + 1
         result['unavailable_streak'] = 0
@@ -520,6 +570,7 @@ def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
         result['last_check'] = now
         return result, f'UNKNOWN: {exc}'
     result['errors'] = 0
+    result['auth_failure_alerted'] = False
     result['last_check'] = now
     result['free_gpus'] = free
     if available:
@@ -552,7 +603,7 @@ def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
             control = read_control_config()
             if control is not None:
                 message += control_section('pause', control)
-            notify('【GPUShare】4080s 型号出现候选空闲 GPU，请手动检查', message)
+            notify(f"【GPUShare】{target['gpu_model']} 出现候选空闲 GPU，请手动检查", message)
             result['alerted'] = True
             result['last_alert'] = now
             return result, 'AVAILABLE: mail sent'
@@ -564,10 +615,75 @@ def cycle(cfg, state, probe=fetch_json, notify=send_mail, now=None):
     return result, f'UNAVAILABLE: {free} free'
 
 
-def health_mail_if_needed(state, notify=send_mail):
+def cycle_many(cfg, state, probe=fetch_json, notify=send_mail, now=None):
+    """Keep independent inventory state and one shared mail-control channel."""
+    result = dict(state)
+    if state.get('paused'):
+        return result, 'PAUSED: all inventory queries disabled'
+    now = now or datetime.now(timezone.utc).isoformat(timespec='seconds')
+    previous = state.get('target_states', {})
+    current, messages = {}, []
+    control_keys = {'paused', 'imap_uidvalidity', 'imap_last_uid', 'used_control_tokens'}
+    for item in target_configs(cfg):
+        key = target_signature(item)
+        old = dict(previous.get(key, {}))
+        if key not in previous and state.get('signature') == key:
+            # Migrate the old single-machine deduplication state without resetting it.
+            old = {k: v for k, v in state.items()
+                   if k not in control_keys and k != 'target_states'}
+        try:
+            updated, message = cycle(item, old, probe=probe, notify=notify, now=now)
+        except (OSError, smtplib.SMTPException, RuntimeError) as error:
+            # A failed notification must not suppress this target or skip the next one.
+            updated = {**old, 'signature': key, 'last_status': 'notification_failed',
+                       'last_check': now, 'errors': old.get('errors', 0) + 1}
+            message = f'NOTIFICATION_FAILED: {type(error).__name__}'
+        current[key] = updated
+        target = item['target']
+        messages.append(f"{target['gpu_model']} {target.get('machine_id', 'any')}: {message}")
+    result['target_states'] = current
+    result.pop('signature', None)
+    result.pop('alerted', None)
+    result.pop('unavailable_streak', None)
+    statuses = [s['last_status'] for s in current.values()]
+    result['last_check'] = now
+    # Authentication alerts remain shared and are sent even if the other query succeeds.
+    for status in ('auth_failed', 'unknown', 'notification_failed', 'available', 'unavailable', 'not_listed'):
+        if status in statuses:
+            result['last_status'] = status
+            break
+    failures = [s for s in current.values()
+                if s['last_status'] in ('auth_failed', 'unknown', 'notification_failed')]
+    result['errors'] = max((s.get('errors', 0) for s in failures), default=0)
+    if failures:
+        result.pop('free_gpus', None)
+    else:
+        result['auth_failure_alerted'] = False
+        result['free_gpus'] = sum(s.get('free_gpus', 0) for s in current.values())
+    return result, ' | '.join(messages)
+
+
+def health_mail_if_needed(state, notify=send_mail, now=None):
+    now = time.time() if now is None else now
+    if state.get('last_status') == 'auth_failed':
+        if (state.get('auth_failure_alerted') and
+                now - state.get('last_auth_alert_epoch', 0) < 6 * 3600):
+            return state
+        notify('【GPUShare】登录态失效或权限不足，请检查 Token',
+               'GPUShare 只读市场接口拒绝了认证，当前无法可靠查询 GPU 库存。\n'
+               '可能原因：Token 已过期、已被撤销，或账号没有访问权限。\n\n'
+               '请自行在浏览器登录 GPUShare，获取新的 Authorization 请求头，'
+               '仅在服务器本地更新项目目录的 .env 中的\n'
+               'GPUSHARE_READ_AUTHORIZATION="Bearer ..."\n'
+               '然后运行：sudo systemctl restart gpushare-monitor.service\n\n'
+               '不要通过邮件或聊天发送 Token。程序不会自动登录或刷新 Token。\n'
+               '持续认证失败时每 6 小时最多提醒一次；成功查询后重新计数。')
+        state['auth_failure_alerted'] = True
+        state['last_auth_alert_epoch'] = now
+        LOG.info('Authentication failure alert submitted to SMTP')
+        return state
     if state.get('errors', 0) < 5:
         return state
-    now = time.time()
     if now - state.get('last_error_alert_epoch', 0) < 6 * 3600:
         return state
     notify('【GPUShare】监测连续失败，需要检查',
@@ -575,6 +691,14 @@ def health_mail_if_needed(state, notify=send_mail):
            '监控失败时不会发送“有卡”通知。')
     state['last_error_alert_epoch'] = now
     return state
+
+
+def poll_delay(cfg, state, elapsed=0):
+    """Schedule rounds 30–40 seconds apart, including normal processing time."""
+    interval = cfg.get('poll_seconds', 30) + random.uniform(0, 10)
+    if state.get('last_status') in ('unknown', 'auth_failed'):
+        interval = max(interval, min(900, 60 * (2 ** min(state.get('errors', 1)-1, 4))))
+    return max(1.0, interval - elapsed)
 
 
 @contextlib.contextmanager
@@ -611,6 +735,7 @@ def main(argv=None):
         LOG.info('暂停测试邮件发送成功')
         return 0
     cfg = json.loads(Path(args.config).read_text(encoding='utf-8'))
+    configs = target_configs(cfg)
     if args.command == 'inspect-json':
         if not args.sample_file:
             raise ValueError('inspect-json 需要 --sample-file 文件路径')
@@ -619,47 +744,52 @@ def main(argv=None):
             raise ValueError('样本文件超过 1 MiB，不予处理')
         data = json.loads(sample_path.read_text(encoding='utf-8'))
         print(describe_json_shape(data))
-        if cfg['target'].get('match_mode') == 'gpu_model':
-            print('--- GPU 型号模式（样例检查，不触发邮件）---')
-            try:
-                available, free = evaluate_market(data, cfg['target'])
-                print(f'available={available}, eligible_free_gpus={free}')
-            except ProbeError as exc:
-                print(f'无法确认市场库存：{exc}')
-        else:
-            print('--- 目标机器匹配 ---')
-            print(inspect_json(data, str(cfg['target']['machine_id'])))
+        for item in configs:
+            print(f"--- {item['target']['gpu_model']} 样例检查（不触发邮件）---")
+            if item['target'].get('match_mode') == 'gpu_model':
+                try:
+                    available, free = evaluate_market(data, item['target'])
+                    print(f'available={available}, eligible_free_gpus={free}')
+                except ProbeError as exc:
+                    print(f'无法确认市场库存：{exc}')
+            else:
+                print(inspect_json(data, str(item['target']['machine_id'])))
         return 0
     if args.command == 'inspect-live':
         # Explicit, single, read-only request only. No need to set confirmed_read_only.
-        validate_market_diagnostic(cfg['source'])
-        data = fetch_json(cfg['source'])
-        print('只读 GET 请求成功；仅输出响应结构，不保存或显示任何字段值。')
-        print(describe_json_shape(data))
-        if cfg['target'].get('match_mode') == 'gpu_model':
-            print('--- GPU 型号模式（样例检查，不触发邮件）---')
-            try:
-                available, free = evaluate_market(data, cfg['target'])
-                print(f'available={available}, eligible_free_gpus={free}')
-            except ProbeError as exc:
-                print(f'无法确认市场库存：{exc}')
-        else:
-            print('--- 目标机器匹配 ---')
-            print(inspect_json(data, str(cfg['target']['machine_id'])))
+        for item in configs:
+            validate_market_diagnostic(item['source'])
+            data = fetch_json(item['source'])
+            print(f"--- {item['target']['gpu_model']} 只读 GET 检查 ---")
+            print(describe_json_shape(data))
+            if item['target'].get('match_mode') == 'gpu_model':
+                try:
+                    available, free = evaluate_market(data, item['target'])
+                    print(f'available={available}, eligible_free_gpus={free}')
+                except ProbeError as exc:
+                    print(f'无法确认市场库存：{exc}')
+            else:
+                print(inspect_json(data, str(item['target']['machine_id'])))
         return 0
     validate(cfg)
     if args.command == 'check':
-        try:
-            avail, free = evaluate(fetch_json(cfg['source']), cfg)
-        except NotListed:
-            print('NOT_LISTED: no matching model/host listed (not a guarantee your VM cannot start)')
-            return 0
-        print(f"{'AVAILABLE' if avail else 'UNAVAILABLE'} eligible_free={free} "
-              f"model={cfg['target']['gpu_model']} mode={cfg['target'].get('match_mode', 'machine')}")
-        return 0
+        exit_code = 0
+        for item in configs:
+            target = item['target']
+            label = f"model={target['gpu_model']} machine={target.get('machine_id', 'any')}"
+            try:
+                avail, free = evaluate(fetch_json(item['source']), item)
+                print(f"{'AVAILABLE' if avail else 'UNAVAILABLE'} eligible_free={free} {label}")
+            except NotListed:
+                print(f'NOT_LISTED: no matching resource in complete listing; {label}')
+            except ProbeError as exc:
+                print(f'UNKNOWN: {exc}; {label}')
+                exit_code = 2
+        return exit_code
     control = read_control_config() if args.command == 'monitor' else None
     with process_lock(args.state):
         while True:
+            round_started = time.monotonic()
             state = load_state(args.state)
             if control is not None:
                 try:
@@ -668,7 +798,7 @@ def main(argv=None):
                     save_state(args.state, state)
                     for action in actions:
                         message = (f'GPUShare 监测已{"暂停" if action == "pause" else "恢复"}。\n'
-                                   '这是监测程序自身状态变化，不会控制云端实例。')
+                                   '此操作适用于全部监控目标，不会控制云端实例。')
                         message += control_section('resume' if action == 'pause' else 'pause', control)
                         try:
                             send_mail(f'【GPUShare】监测已{"暂停" if action == "pause" else "恢复"}', message)
@@ -682,10 +812,13 @@ def main(argv=None):
                 LOG.info('PAUSED: email control; only checking for resume messages')
                 if args.command == 'once':
                     return 0
-                time.sleep(cfg.get('poll_seconds', 60))
+                time.sleep(poll_delay(cfg, {}, time.monotonic() - round_started))
                 continue
             try:
-                state, msg = cycle(cfg, state)
+                if len(configs) > 1 or 'target_states' in state:
+                    state, msg = cycle_many(cfg, state)
+                else:
+                    state, msg = cycle(cfg, state)
                 try:
                     state = health_mail_if_needed(state)
                 except (OSError, smtplib.SMTPException, RuntimeError) as exc:
@@ -698,11 +831,8 @@ def main(argv=None):
             save_state(args.state, state)
             LOG.info('%s', msg)
             if args.command == 'once':
-                return 1 if msg.startswith('UNKNOWN') or msg == 'NOTIFICATION_FAILED' else 0
-            delay = cfg.get('poll_seconds', 60) + random.uniform(0, 10)
-            if msg.startswith('UNKNOWN'):
-                delay = max(delay, min(900, 60 * (2 ** min(state.get('errors', 1)-1, 4))))
-            time.sleep(delay)
+                return 1 if state.get('last_status') in ('unknown', 'auth_failed', 'notification_failed') else 0
+            time.sleep(poll_delay(cfg, state, time.monotonic() - round_started))
 
 
 if __name__ == '__main__':

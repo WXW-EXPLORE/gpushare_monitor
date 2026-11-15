@@ -20,11 +20,11 @@ def config():
     return read_control_config(ENV)
 
 
-def make_header(action, token, sender='owner@example.test'):
+def make_header(action, token, sender='owner@example.test', separator=' '):
     msg = EmailMessage()
     msg['From'] = sender
     msg['To'] = 'monitor@example.test'
-    msg['Subject'] = f'GPUCTRL {action.upper()} {token}'
+    msg['Subject'] = separator.join(('GPUCTRL', action.upper(), token))
     msg.set_content('Send control')
     return msg.as_bytes().split(b'\n\n', 1)[0] + b'\n\n'
 
@@ -79,6 +79,8 @@ class ControlTests(unittest.TestCase):
         parsed = urlparse(url)
         self.assertEqual(parsed.scheme, 'mailto')
         self.assertEqual(parsed.path, 'monitor@example.test')
+        self.assertIn('subject=GPUCTRL%20PAUSE%20', parsed.query)
+        self.assertNotIn('+', parsed.query)
         subject = parse_qs(parsed.query)['subject'][0]
         self.assertTrue(subject.startswith('GPUCTRL PAUSE '))
         self.assertIn('请保持邮件主题', parse_qs(parsed.query)['body'][0])
@@ -93,6 +95,25 @@ class ControlTests(unittest.TestCase):
     def test_controls_are_not_gpu_actions(self):
         self.assertIn('暂停监测', control_section('pause', config()))
         self.assertIn('恢复监测', control_section('resume', config()))
+
+    def test_legacy_plus_subject_requires_valid_sender_signature_and_no_replay(self):
+        cfg = config()
+        token = make_token('pause', cfg['secret'], now=100000)
+        header = make_header('pause', token, separator='+')
+        self.assertEqual(parse_control_message(header, cfg, now=100000), 'pause')
+        self.assertIsNone(parse_control_message(
+            make_header('pause', token, sender='other@example.test', separator='+'), cfg, now=100000))
+        self.assertIsNone(parse_control_message(
+            make_header('resume', token, separator='+'), cfg, now=100000))
+        fake = FakeIMAP('x', 993, 15)
+        state = {'imap_uidvalidity': '1001', 'imap_last_uid': 0}
+        fake.messages[1] = header
+        state, actions = scan_mail_controls(state, cfg, client_factory=lambda *a, **k: fake, now=100000)
+        self.assertEqual(actions, ['pause'])
+        self.assertTrue(state['paused'])
+        fake.messages[2] = header
+        state, actions = scan_mail_controls(state, cfg, client_factory=lambda *a, **k: fake, now=100000)
+        self.assertEqual(actions, [])
 
     def test_imap_first_poll_skips_old_messages(self):
         fake = FakeIMAP('x', 993, 15)
@@ -131,6 +152,18 @@ class ControlTests(unittest.TestCase):
         st, actions = scan_mail_controls(st, config(), client_factory=lambda *a, **k:fake, now=100000)
         self.assertEqual(actions, [])
         self.assertFalse(st.get('paused', False))
+
+    def test_resume_rearms_every_machine_without_mutating_previous_state(self):
+        fake = FakeIMAP('x', 993, 15)
+        original = {'paused': True, 'imap_uidvalidity': '1001', 'imap_last_uid': 0,
+                    'target_states': {'first': {'alerted': True}, 'second': {'alerted': True}}}
+        fake.messages[1] = make_header('resume', make_token('resume', config()['secret'], now=100000))
+        result, actions = scan_mail_controls(original, config(),
+            client_factory=lambda *a, **k: fake, now=100000)
+        self.assertEqual(actions, ['resume'])
+        self.assertFalse(result['paused'])
+        self.assertTrue(all(not value['alerted'] for value in result['target_states'].values()))
+        self.assertTrue(original['target_states']['first']['alerted'])
 
     def test_uid_validity_reset_skips_old_commands(self):
         fake = FakeIMAP('x', 993, 15)
